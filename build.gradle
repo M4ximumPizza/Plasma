@@ -1,0 +1,43 @@
+plugins {
+    id 'java'
+    id 'java-library'
+    id 'maven-publish'
+}
+
+group = 'mi.m4x.plasma'
+version = '1.0.0-SNAPSHOT'
+
+java {
+    withSourcesJar()
+    withJavadocJar()
+}
+
+
+dependencies {
+    implementation 'org.slf4j:slf4j-api:2.0.13'
+    runtimeOnly 'org.slf4j:slf4j-simple:2.0.13'
+    implementation 'org.jetbrains:annotations:24.1.0'
+}
+
+tasks.named('jar') {
+    duplicatesStrategy DuplicatesStrategy.INCLUDE
+    from sourceSets.main.output
+}
+
+tasks.named('sourcesJar') {
+    duplicatesStrategy DuplicatesStrategy.INCLUDE
+    from sourceSets.main.allSource
+}
+
+tasks.named('javadocJar') {
+    duplicatesStrategy DuplicatesStrategy.INCLUDE
+    from tasks.javadoc.destinationDir
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+        }
+    }
+}
