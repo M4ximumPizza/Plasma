@@ -5,6 +5,7 @@ import java.io.*;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
 import java.lang.management.MemoryUsage;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Map;
@@ -31,8 +32,8 @@ public class CrashReport {
      * @param description A brief description of what was happening at the time of the crash.
      */
     public static void generate(Throwable throwable, String description) {
-        // Timestamp for unique crash report filename
-        String timestamp = new SimpleDateFormat("yyyy-MM-dd_HH.mm.ss").format(new Date());
+        // Timestamp for unique crash report filename (includes milliseconds)
+        String timestamp = new SimpleDateFormat("yyyy-MM-dd_HH.mm.ss.SSS").format(new Date());
         String fileName = "crash-report-" + timestamp + ".txt";
 
         StringBuilder report = new StringBuilder();
@@ -52,19 +53,24 @@ public class CrashReport {
                 .append(" (").append(System.getProperty("java.vendor")).append(")\n");
         report.append("JVM: ").append(System.getProperty("java.vm.name"))
                 .append(" ").append(System.getProperty("java.vm.version")).append("\n");
-        report.append("Available Processors: ").append(Runtime.getRuntime().availableProcessors()).append("\n");
+        report.append("Available Processors: ").append(Runtime.getRuntime().availableProcessors()).append("\n\n");
 
-        // MEMORY USAGE: heap and non-heap memory statistics
+        // MEMORY USAGE: heap and non-heap memory statistics (includes init)
         MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
         MemoryUsage heap = memoryBean.getHeapMemoryUsage();
         MemoryUsage nonHeap = memoryBean.getNonHeapMemoryUsage();
-        report.append(String.format("Heap Memory: Used %d MB / Max %d MB / Committed %d MB\n",
+
+        report.append(String.format("Heap Memory: Init %d MB / Used %d MB / Committed %d MB / Max %d MB\n",
+                heap.getInit() / (1024 * 1024),
                 heap.getUsed() / (1024 * 1024),
-                heap.getMax() / (1024 * 1024),
-                heap.getCommitted() / (1024 * 1024)));
-        report.append(String.format("Non-Heap Memory: Used %d MB / Committed %d MB\n",
+                heap.getCommitted() / (1024 * 1024),
+                heap.getMax() / (1024 * 1024)));
+
+        report.append(String.format("Non-Heap Memory: Init %d MB / Used %d MB / Committed %d MB\n",
+                nonHeap.getInit() / (1024 * 1024),
                 nonHeap.getUsed() / (1024 * 1024),
                 nonHeap.getCommitted() / (1024 * 1024)));
+
         report.append("\n");
 
         // DISPLAY INFORMATION: screen resolution and refresh rate
@@ -117,11 +123,69 @@ public class CrashReport {
         }
         report.append("\n");
 
-        // THREAD INFORMATION: current thread name and ID
+        // THREAD INFORMATION: current thread name and ID + all active threads
         report.append("== Thread Info ==\n");
         Thread currentThread = Thread.currentThread();
         report.append("Current Thread: ").append(currentThread.getName())
                 .append(" (ID: ").append(currentThread.getId()).append(")\n\n");
+
+        Map<Thread, StackTraceElement[]> allThreads = Thread.getAllStackTraces();
+        report.append("== All Live Threads and Stack Traces ==\n");
+
+        int daemonCount = 0; // Count of daemon threads
+        for (Map.Entry<Thread, StackTraceElement[]> entry : allThreads.entrySet()) {
+            Thread t = entry.getKey();
+            StackTraceElement[] stack = entry.getValue();
+            report.append("Thread: ").append(t.getName())
+                    .append(" (ID: ").append(t.getId())
+                    .append(", State: ").append(t.getState())
+                    .append(", Daemon: ").append(t.isDaemon()).append(")\n");
+            if (t.isDaemon()) daemonCount++;
+
+            if (stack != null && stack.length > 0) {
+                for (StackTraceElement elem : stack) {
+                    report.append("\tat ").append(elem.toString()).append("\n");
+                }
+            } else {
+                report.append("\t<No stack trace available>\n");
+            }
+            report.append("\n");
+        }
+
+        // Add daemon thread summary
+        report.append("== Daemon Thread Summary ==\n");
+        report.append("Total Threads: ").append(allThreads.size()).append("\n");
+        report.append("Daemon Threads: ").append(daemonCount).append("\n");
+        report.append("Non-Daemon Threads: ").append(allThreads.size() - daemonCount).append("\n\n");
+
+        // EXCEPTION ORIGIN CLASS INFO: type, superclass, interfaces
+        report.append("== Exception Origin Class Info ==\n");
+        StackTraceElement[] stackTrace = throwable.getStackTrace();
+        if (stackTrace.length > 0) {
+            try {
+                String className = stackTrace[0].getClassName();
+                Class<?> clazz = Class.forName(className);
+                report.append("Class Name: ").append(clazz.getName()).append("\n");
+                report.append("Superclass: ").append(clazz.getSuperclass() != null ? clazz.getSuperclass().getName() : "None").append("\n");
+
+                Class<?>[] interfaces = clazz.getInterfaces();
+                if (interfaces.length > 0) {
+                    report.append("Interfaces: ");
+                    for (int i = 0; i < interfaces.length; i++) {
+                        report.append(interfaces[i].getName());
+                        if (i < interfaces.length - 1) report.append(", ");
+                    }
+                    report.append("\n");
+                } else {
+                    report.append("Interfaces: None\n");
+                }
+            } catch (ClassNotFoundException e) {
+                report.append("Class information unavailable: ").append(e.getMessage()).append("\n");
+            }
+        } else {
+            report.append("No stack trace available to determine class info.\n");
+        }
+        report.append("\n");
 
         // STACK TRACE: full exception stack for debugging
         report.append("== Stack Trace ==\n");
@@ -130,8 +194,9 @@ public class CrashReport {
         throwable.printStackTrace(pw);
         report.append(sw.toString()).append("\n");
 
-        // Write crash report to a timestamped text file
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(fileName))) {
+        // Write crash report to a timestamped text file (UTF-8)
+        try (BufferedWriter writer = new BufferedWriter(
+                new OutputStreamWriter(new FileOutputStream(fileName), StandardCharsets.UTF_8))) {
             writer.write(report.toString());
             System.out.println("Crash report saved as " + fileName);
         } catch (IOException e) {
