@@ -1,4 +1,4 @@
-package mi.m4x.plasma.probe;
+package mi.m4x.plasma.probe.gpu;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

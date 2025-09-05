@@ -1,4 +1,4 @@
-package mi.m4x.plasma;
+package mi.m4x.plasma.probe.crash;
 
 import mi.m4x.plasma.crash.CrashReport;
 
@@ -11,15 +11,12 @@ public class CrashReportDemo {
             } catch (Throwable e) {
                 CrashReport.generate(e, "Another crash report for testing purposes");
             }
-        }, "gay");
-
-        // Set thread as daemon
-        crashThread.setDaemon(true);
+        }, "Test Thread");
 
         crashThread.start();
 
         try {
-            crashThread.join(); // optional; joining a daemon thread is okay but not required
+            crashThread.join();
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
