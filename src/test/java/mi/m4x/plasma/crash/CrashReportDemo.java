@@ -1,4 +1,4 @@
-package mi.m4x.plasma.probe.crash;
+package mi.m4x.plasma.crash;
 
 import mi.m4x.plasma.crash.CrashReport;
 
