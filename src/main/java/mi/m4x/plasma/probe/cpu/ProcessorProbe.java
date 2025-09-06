@@ -63,10 +63,10 @@ public class ProcessorProbe {
                     String logicalProcessors = parts.length > 2 ? parts[2].trim() : "Unknown";
                     String arch = System.getProperty("os.arch");
 
-                    System.out.println("CPU Name: " + name);
-                    System.out.println("Number of Cores: " + cores);
-                    System.out.println("Number of Logical Processors: " + logicalProcessors);
-                    System.out.println("Architecture: " + arch);
+                    LOGGER.info("CPU Name: " + name);
+                    LOGGER.info("Number of Cores: " + cores);
+                    LOGGER.info("Number of Logical Processors: " + logicalProcessors);
+                    LOGGER.info("Architecture: " + arch);
                 }
             }
         } catch (Exception e) {
