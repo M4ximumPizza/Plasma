@@ -18,7 +18,7 @@ import java.util.Locale;
 public class ProcessorProbe {
 
     // Logger for debugging and info messages
-    private static Logger LOGGER = LoggerFactory.getLogger(ProcessorProbe.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(ProcessorProbe.class);
 
     /**
      * Main entry point to detect CPU information.
@@ -40,33 +40,34 @@ public class ProcessorProbe {
     }
 
     /**
-     * Detects CPU information on Windows using WMIC.
-     * Parses Name, Number of Cores, and Number of Logical Processors.
-     * Architecture is retrieved from environment variable PROCESSOR_ARCHITECTURE.
+     * Detects CPU information on Windows using PowerShell (Get-CimInstance).
+     * Outputs a single line: Name;Cores;LogicalProcessors
      */
     private static void detectWindowsCpu() {
         try {
-            Process process = new ProcessBuilder(
-                    "wmic", "cpu", "get", "Name,NumberOfCores,NumberOfLogicalProcessors"
-            ).redirectErrorStream(true).start();
+            String psCommand =
+                    "Get-CimInstance Win32_Processor | " +
+                            "Select-Object -First 1 -Property Name,NumberOfCores,NumberOfLogicalProcessors | " +
+                            "ForEach-Object { ($_.Name + ';' + $_.NumberOfCores + ';' + $_.NumberOfLogicalProcessors) }";
+
+            Process process = new ProcessBuilder("powershell", "-Command", psCommand)
+                    .redirectErrorStream(true)
+                    .start();
 
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                reader.lines()
-                        // Filter out empty lines and header row
-                        .filter(line -> !line.trim().isEmpty() && !line.startsWith("Name"))
-                        .forEach(line -> {
-                            String[] parts = line.trim().split("\\s{2,}"); // Split columns by multiple spaces
-                            String name = parts[0]; // CPU name
-                            String cores = parts.length > 1 ? parts[1] : "Unknown"; // Physical cores
-                            String logicalProcessors = parts.length > 2 ? parts[2] : "Unknown"; // Logical cores
-                            String architecture = System.getenv("PROCESSOR_ARCHITECTURE"); // CPU architecture
+                String line = reader.readLine();
+                if (line != null && !line.isBlank()) {
+                    String[] parts = line.split(";");
+                    String name = parts.length > 0 ? parts[0].trim() : "Unknown";
+                    String cores = parts.length > 1 ? parts[1].trim() : "Unknown";
+                    String logicalProcessors = parts.length > 2 ? parts[2].trim() : "Unknown";
+                    String arch = System.getProperty("os.arch");
 
-                            // Print detected CPU info
-                            System.out.println("CPU Name: " + name);
-                            System.out.println("Number of Cores: " + cores);
-                            System.out.println("Number of Logical Processors: " + logicalProcessors);
-                            System.out.println("Architecture: " + architecture);
-                        });
+                    System.out.println("CPU Name: " + name);
+                    System.out.println("Number of Cores: " + cores);
+                    System.out.println("Number of Logical Processors: " + logicalProcessors);
+                    System.out.println("Architecture: " + arch);
+                }
             }
         } catch (Exception e) {
             System.err.println("Failed to detect CPU information on Windows");
@@ -76,25 +77,36 @@ public class ProcessorProbe {
 
     /**
      * Detects CPU information on macOS using sysctl.
-     * CPU name is retrieved from machdep.cpu.brand_string.
-     * Number of cores is approximated using Runtime.getRuntime().availableProcessors().
-     * Architecture is retrieved via os.arch system property.
+     * Gets brand string, physical cores, and logical processors.
      */
     private static void detectMacCpu() {
         try {
-            Process process = new ProcessBuilder(
-                    "sysctl", "-n", "machdep.cpu.brand_string"
-            ).start();
-
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String name = reader.readLine(); // CPU model name
-                int cores = Runtime.getRuntime().availableProcessors(); // Number of cores (logical)
-
-                // Print detected CPU info
-                System.out.println("CPU Name: " + name);
-                System.out.println("Number of Cores: " + cores);
-                System.out.println("Architecture: " + System.getProperty("os.arch"));
+            Process brandProcess = new ProcessBuilder("sysctl", "-n", "machdep.cpu.brand_string").start();
+            String name;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(brandProcess.getInputStream()))) {
+                name = reader.readLine();
             }
+
+            // Physical cores
+            Process coresProcess = new ProcessBuilder("sysctl", "-n", "hw.physicalcpu").start();
+            String cores;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(coresProcess.getInputStream()))) {
+                cores = reader.readLine();
+            }
+
+            // Logical processors
+            Process logicalProcess = new ProcessBuilder("sysctl", "-n", "hw.logicalcpu").start();
+            String logicalProcessors;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(logicalProcess.getInputStream()))) {
+                logicalProcessors = reader.readLine();
+            }
+
+            // Print detected CPU info
+            System.out.println("CPU Name: " + (name != null ? name : "Unknown"));
+            System.out.println("Number of Cores: " + (cores != null ? cores : "Unknown"));
+            System.out.println("Number of Logical Processors: " + (logicalProcessors != null ? logicalProcessors : "Unknown"));
+            System.out.println("Architecture: " + System.getProperty("os.arch"));
+
         } catch (Exception e) {
             System.err.println("Failed to detect CPU information on macOS");
             e.printStackTrace();
@@ -103,20 +115,20 @@ public class ProcessorProbe {
 
     /**
      * Detects CPU information on Linux using the 'lscpu' command.
-     * Parses CPU model name, physical cores, logical processors, and architecture.
+     * Extracts CPU model, physical cores, logical processors, and architecture.
      */
     private static void detectLinuxCpu() {
         try {
             Process process = new ProcessBuilder("lscpu").start();
 
+            String name = "Unknown";
+            String coresPerSocket = "Unknown";
+            String sockets = "1";
+            String logicalProcessors = "Unknown";
+            String architecture = System.getProperty("os.arch");
+
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
                 String line;
-                String name = "Unknown";
-                String cores = "Unknown";
-                String logicalProcessors = "Unknown";
-                String architecture = "Unknown";
-
-                // Read lscpu output line by line and extract relevant information
                 while ((line = reader.readLine()) != null) {
                     line = line.trim();
                     if (line.startsWith("Model name:")) {
@@ -124,18 +136,29 @@ public class ProcessorProbe {
                     } else if (line.startsWith("CPU(s):")) {
                         logicalProcessors = line.split(":", 2)[1].trim();
                     } else if (line.startsWith("Core(s) per socket:")) {
-                        cores = line.split(":", 2)[1].trim();
+                        coresPerSocket = line.split(":", 2)[1].trim();
+                    } else if (line.startsWith("Socket(s):")) {
+                        sockets = line.split(":", 2)[1].trim();
                     } else if (line.startsWith("Architecture:")) {
                         architecture = line.split(":", 2)[1].trim();
                     }
                 }
-
-                // Print detected CPU info
-                System.out.println("CPU Name: " + name);
-                System.out.println("Number of Cores: " + cores);
-                System.out.println("Number of Logical Processors: " + logicalProcessors);
-                System.out.println("Architecture: " + architecture);
             }
+
+            // Calculate total physical cores
+            String totalCores = "Unknown";
+            try {
+                int cores = Integer.parseInt(coresPerSocket);
+                int sock = Integer.parseInt(sockets);
+                totalCores = String.valueOf(cores * sock);
+            } catch (NumberFormatException ignored) {}
+
+            // Print detected CPU info
+            System.out.println("CPU Name: " + name);
+            System.out.println("Number of Cores: " + totalCores);
+            System.out.println("Number of Logical Processors: " + logicalProcessors);
+            System.out.println("Architecture: " + architecture);
+
         } catch (Exception e) {
             System.err.println("Failed to detect CPU information on Linux");
             e.printStackTrace();
