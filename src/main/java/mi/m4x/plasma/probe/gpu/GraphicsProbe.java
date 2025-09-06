@@ -16,34 +16,25 @@ import java.util.Locale;
  * Simple cross-platform graphics adapter detection (Windows, Linux, macOS),
  * with automatic virtual GPU fallback for VMs.
  *
+ * Uses dxdiag on Windows (WMIC is deprecated and removed in Win11+).
+ *
  * @author M4ximumpizza
  * @since 1.0.0
  */
 public class GraphicsProbe {
 
-    // Logger for outputting information, warnings, and errors
     private static final Logger LOGGER = LoggerFactory.getLogger(GraphicsProbe.class);
 
-    // List to store detected graphics adapters
     private static final List<GraphicsAdapter> ADAPTERS = new ArrayList<>();
 
     // -----------------------------------------
     // Public API
     // -----------------------------------------
 
-    /**
-     * Returns an unmodifiable list of detected graphics adapters.
-     * @return list of GraphicsAdapter objects
-     */
     public static List<GraphicsAdapter> getAdapters() {
         return Collections.unmodifiableList(ADAPTERS);
     }
 
-    /**
-     * Main entry point for detecting graphics adapters on the current OS.
-     * Automatically chooses the detection method based on OS type.
-     * Adds a virtual GPU fallback if running in a VM and no real GPU is found.
-     */
     public static void detectGraphicsAdapters() {
         String os = System.getProperty("os.name").toLowerCase(Locale.ENGLISH);
         try {
@@ -59,13 +50,12 @@ public class GraphicsProbe {
                 LOGGER.warn("Unsupported OS: {}", os);
             }
 
-            // If nothing detected on Linux, add a virtual GPU as fallback (common in VMs)
+            // Fallback for VMs
             if (ADAPTERS.isEmpty() && (os.contains("nix") || os.contains("nux") || os.contains("aix"))) {
                 LOGGER.info("No real GPU detected, adding Virtual GPU fallback for VM.");
                 ADAPTERS.add(new GraphicsAdapter("Virtual GPU (VM)", "UNKNOWN"));
             }
 
-            // Log all detected adapters
             logDetectedAdapters();
         } catch (Exception e) {
             LOGGER.error("Failed to detect graphics adapters", e);
@@ -77,49 +67,49 @@ public class GraphicsProbe {
     // -----------------------------------------
 
     /**
-     * Detects graphics adapters on Windows using WMIC.
-     * Extracts adapter name and PCI device ID from the PNPDeviceID string.
+     * Detects graphics adapters on Windows using dxdiag (WMIC is deprecated).
      */
     private static void detectWindowsAdapters() {
         try {
-            Process process = new ProcessBuilder("wmic", "path", "win32_videocontroller", "get", "Name,PNPDeviceID")
+            String psCommand =
+                    "Get-CimInstance Win32_VideoController | " +
+                            "ForEach-Object { $_.Name + ';' + $_.PNPDeviceID }";
+
+            Process process = new ProcessBuilder("powershell", "-Command", psCommand)
                     .redirectErrorStream(true)
                     .start();
 
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                reader.lines()
-                        .map(String::trim)
-                        .filter(line -> !line.isEmpty() && !line.startsWith("Name"))
-                        .forEach(line -> {
-                            String name = "";
-                            String pciId = "UNKNOWN";
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isEmpty()) continue;
 
-                            // Split the line into name and PNPDeviceID
-                            String[] parts = line.split("\\s{2,}");
-                            if (parts.length >= 2) {
-                                name = parts[0];
-                                String pnp = parts[1];
-                                // Extract vendor (VEN) and device (DEV) IDs if available
-                                if (pnp.contains("VEN_") && pnp.contains("DEV_")) {
-                                    String ven = pnp.substring(pnp.indexOf("VEN_") + 4, pnp.indexOf("VEN_") + 8);
-                                    String dev = pnp.substring(pnp.indexOf("DEV_") + 4, pnp.indexOf("DEV_") + 8);
-                                    pciId = "0x" + ven.toUpperCase() + ":0x" + dev.toUpperCase();
-                                }
-                            } else {
-                                name = line;
-                            }
+                    String[] parts = line.split(";", 2);
+                    String name = parts.length > 0 ? parts[0].trim() : "Unknown GPU";
+                    String pciId = "UNKNOWN";
 
-                            ADAPTERS.add(new GraphicsAdapter(name, pciId));
-                        });
+                    if (parts.length > 1) {
+                        String pnp = parts[1];
+                        if (pnp.contains("VEN_") && pnp.contains("DEV_")) {
+                            String ven = pnp.substring(pnp.indexOf("VEN_") + 4, pnp.indexOf("VEN_") + 8);
+                            String dev = pnp.substring(pnp.indexOf("DEV_") + 4, pnp.indexOf("DEV_") + 8);
+                            pciId = "0x" + ven.toUpperCase() + ":0x" + dev.toUpperCase();
+                        }
+                    }
+
+                    ADAPTERS.add(new GraphicsAdapter(name, pciId));
+                }
             }
+
         } catch (Exception e) {
             LOGGER.error("Error detecting Windows graphics adapters", e);
         }
     }
 
+
     /**
-     * Detects graphics adapters on Linux by reading PCI device information.
-     * Maps vendor IDs to known GPU manufacturers (NVIDIA, AMD, Intel).
+     * Detects graphics adapters on Linux via sysfs PCI devices.
      */
     private static void detectLinuxAdapters() {
         File pciRoot = new File("/sys/bus/pci/devices/");
@@ -161,7 +151,7 @@ public class GraphicsProbe {
     }
 
     /**
-     * Detects graphics adapters on macOS by parsing `system_profiler SPDisplaysDataType` output.
+     * Detects graphics adapters on macOS via system_profiler.
      */
     private static void detectMacAdapters() {
         try {
@@ -170,12 +160,9 @@ public class GraphicsProbe {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     line = line.trim();
-                    // Look for lines containing the GPU name
-                    if (line.startsWith("Chipset Model:") || line.startsWith("Graphics/Displays:")) {
-                        String name = line.contains(":") ? line.split(":")[1].trim() : line;
-                        if (!name.isEmpty() && !name.equalsIgnoreCase("Graphics/Displays")) {
-                            ADAPTERS.add(new GraphicsAdapter(name, "UNKNOWN"));
-                        }
+                    if (line.startsWith("Chipset Model:")) {
+                        String name = line.split(":", 2)[1].trim();
+                        ADAPTERS.add(new GraphicsAdapter(name, "UNKNOWN"));
                     }
                 }
             }
@@ -188,10 +175,6 @@ public class GraphicsProbe {
     // Logging Helpers
     // -----------------------------------------
 
-    /**
-     * Logs the list of detected graphics adapters.
-     * If none detected, prints a warning.
-     */
     private static void logDetectedAdapters() {
         if (ADAPTERS.isEmpty()) {
             LOGGER.warn("No graphics adapters detected.");
@@ -208,11 +191,6 @@ public class GraphicsProbe {
     // GraphicsAdapter Record
     // -----------------------------------------
 
-    /**
-     * Represents a detected graphics adapter.
-     * @param name Human-readable GPU name
-     * @param pciId PCI vendor:device ID (or "UNKNOWN" if unavailable)
-     */
     public record GraphicsAdapter(
             String name,
             String pciId
