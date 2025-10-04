@@ -85,44 +85,6 @@ public class CrashReport {
         }
         report.append("\n");
 
-        // ENVIRONMENT VARIABLES: redact sensitive info such as user paths and tokens
-        report.append("== Environment Variables ==\n");
-        String username = System.getProperty("user.name");
-        for (Map.Entry<String, String> entry : System.getenv().entrySet()) {
-            String key = entry.getKey();
-            String value = entry.getValue();
-
-            // Skip variables that expose user/computer info
-            if (key.equalsIgnoreCase("USERNAME") ||
-                    key.equalsIgnoreCase("USERPROFILE") ||
-                    key.equalsIgnoreCase("HOMEPATH") ||
-                    key.equalsIgnoreCase("HOMEDRIVE") ||
-                    key.equalsIgnoreCase("COMPUTERNAME") ||
-                    key.equalsIgnoreCase("USERDOMAIN") ||
-                    key.equalsIgnoreCase("LOGONSERVER") ||
-                    key.equalsIgnoreCase("USERDOMAIN_ROAMINGPROFILE")) {
-                continue;
-            }
-
-            // Replace occurrences of the username in any path with [REDACTED_USER]
-            if (value != null && username != null) {
-                value = value.replace(username, "[REDACTED_USER]");
-            }
-
-            // Redact environment variables likely to contain tokens or secrets
-            if (key.toUpperCase().matches(".*(TOKEN|SECRET|KEY|PASSWORD|ACCESS|AUTH|GIT|GRADLE|AWS).*")) {
-                value = "[REDACTED_TOKEN]";
-            }
-
-            // Redact any long token-like strings anywhere in the variable value
-            if (value != null) {
-                value = TOKEN_PATTERN.matcher(value).replaceAll("[REDACTED_TOKEN]");
-            }
-
-            report.append(key).append(" = ").append(value).append("\n");
-        }
-        report.append("\n");
-
         // THREAD INFORMATION: current thread name and ID + all active threads
         report.append("== Thread Info ==\n");
         Thread currentThread = Thread.currentThread();
