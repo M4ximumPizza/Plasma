@@ -13,8 +13,7 @@ import java.util.regex.Pattern;
 
 /**
  * Utility class to generate detailed crash reports for uncaught exceptions.
- * The report includes system information, environment variables, thread info, and stack trace.
- * Sensitive information such as usernames, user paths, and tokens are automatically redacted.
+ * The report includes system information, thread info, and stack trace.
  *
  * @author M4ximumpizza
  * @since 1.0.0
