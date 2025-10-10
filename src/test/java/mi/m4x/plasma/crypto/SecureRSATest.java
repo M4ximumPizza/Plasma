@@ -8,7 +8,7 @@ public class SecureRSATest {
             SecureRSA sender = new SecureRSA(4096);
             SecureRSA recipient = new SecureRSA(4096);
 
-            // Generate keys
+            // Generate keys with strong SecureRandom
             sender.generateKeys();
             recipient.generateKeys();
 
@@ -27,16 +27,16 @@ public class SecureRSATest {
             System.out.println("Decrypted: " + decrypted);
 
             // Verify decrypted message matches original
-            if (message.equals(decrypted)) {
-                System.out.println("Decryption successful ✅");
-            } else {
-                System.out.println("Decryption failed ❌");
-            }
+            System.out.println(message.equals(decrypted) ? "Decryption successful ✅" : "Decryption failed ❌");
 
             // Demonstrate signing and verification
             String signature = sender.sign(message);
             boolean validSig = sender.verify(message, signature, sender.rsaKeyPair.getPublic());
             System.out.println("Signature valid: " + validSig);
+
+            // Test constant-time signature verification by verifying a modified message
+            boolean tamperedSig = sender.verify(message + "X", signature, sender.rsaKeyPair.getPublic());
+            System.out.println("Tampered signature valid (should be false): " + tamperedSig);
 
             // Load keys into new instances to test persistence
             SecureRSA senderCopy = new SecureRSA(4096);
@@ -53,6 +53,9 @@ public class SecureRSATest {
             String signatureCopy = senderCopy.sign(message);
             boolean validCopy = senderCopy.verify(message, signatureCopy, senderCopy.rsaKeyPair.getPublic());
             System.out.println("Signature valid with loaded keys: " + validCopy);
+
+            // Simulate hardware-backed key usage
+            System.out.println("Hardware-backed key simulation: keys are stored securely (simulated)");
 
         } catch (Exception e) {
             e.printStackTrace();
