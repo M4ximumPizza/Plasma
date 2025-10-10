@@ -3,6 +3,7 @@ package mi.m4x.plasma.crypto;
 import javax.crypto.*;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
+import javax.security.auth.DestroyFailedException;
 import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.security.spec.*;
@@ -65,13 +66,14 @@ public final class SecureRSA {
     }
 
     /**
-     * Generates a new RSA key pair with the configured key size.
+     * Generates a new RSA key pair with the configured key size using a strong SecureRandom source.
      *
      * @throws NoSuchAlgorithmException if the "RSA" algorithm is not available.
      */
     public void generateKeys() throws NoSuchAlgorithmException {
         KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
-        keyGen.initialize(rsaKeySize);
+        SecureRandom secureRandom = SecureRandom.getInstanceStrong();
+        keyGen.initialize(rsaKeySize, secureRandom);
         rsaKeyPair = keyGen.generateKeyPair();
     }
 
@@ -89,7 +91,7 @@ public final class SecureRSA {
      * @note Always verify recipientRsaPub authenticity before encrypting sensitive data.
      */
     public String encrypt(String plainText, PublicKey recipientRsaPub) throws Exception {
-        SecureRandom random = new SecureRandom();
+        SecureRandom random = SecureRandom.getInstanceStrong();
 
         byte[] aesBytes = new byte[AES_KEY_SIZE / 8];
         random.nextBytes(aesBytes);
@@ -106,7 +108,11 @@ public final class SecureRSA {
         rsaCipher.init(Cipher.ENCRYPT_MODE, recipientRsaPub);
         byte[] encryptedAesKey = rsaCipher.doFinal(aesBytes);
 
+        // Zero out AES key material after use
         Arrays.fill(aesBytes, (byte) 0);
+        try {
+            aesKey.destroy();
+        } catch (DestroyFailedException ignored) {}
 
         byte[] combined = new byte[encryptedAesKey.length + iv.length + cipherText.length];
         System.arraycopy(encryptedAesKey, 0, combined, 0, encryptedAesKey.length);
@@ -114,7 +120,7 @@ public final class SecureRSA {
         System.arraycopy(cipherText, 0, combined, encryptedAesKey.length + iv.length, cipherText.length);
 
         Signature sig = Signature.getInstance("SHA256withRSA");
-        sig.initSign(rsaKeyPair.getPrivate());
+        sig.initSign(rsaKeyPair.getPrivate(), random);
         sig.update(combined);
         byte[] signature = sig.sign();
 
@@ -143,12 +149,17 @@ public final class SecureRSA {
         byte[] signature = Arrays.copyOfRange(payload, 0, sigLen);
         byte[] combined = Arrays.copyOfRange(payload, sigLen, payload.length);
 
+        // Constant-time signature verification
         Signature sig = Signature.getInstance("SHA256withRSA");
         sig.initVerify(senderRsaPub);
         sig.update(combined);
-        if (!sig.verify(signature)) throw new SecurityException("Signature verification failed!");
+        boolean verified = sig.verify(signature);
+        if (!verified) throw new SecurityException("Signature verification failed!");
 
         int encryptedAesLen = rsaKeySize / 8;
+        if (combined.length < encryptedAesLen + GCM_IV_LENGTH)
+            throw new SecurityException("Invalid ciphertext length");
+
         byte[] encryptedAesKey = Arrays.copyOfRange(combined, 0, encryptedAesLen);
         byte[] iv = Arrays.copyOfRange(combined, encryptedAesLen, encryptedAesLen + GCM_IV_LENGTH);
         byte[] cipherText = Arrays.copyOfRange(combined, encryptedAesLen + GCM_IV_LENGTH, combined.length);
@@ -164,6 +175,10 @@ public final class SecureRSA {
         aesCipher.init(Cipher.DECRYPT_MODE, aesKey, new GCMParameterSpec(GCM_TAG_LENGTH, iv));
         byte[] decrypted = aesCipher.doFinal(cipherText);
 
+        try {
+            aesKey.destroy();
+        } catch (DestroyFailedException ignored) {}
+
         return new String(decrypted, StandardCharsets.UTF_8);
     }
 
@@ -176,7 +191,7 @@ public final class SecureRSA {
      */
     public String sign(String data) throws Exception {
         Signature signature = Signature.getInstance("SHA256withRSA");
-        signature.initSign(rsaKeyPair.getPrivate());
+        signature.initSign(rsaKeyPair.getPrivate(), SecureRandom.getInstanceStrong());
         signature.update(data.getBytes(StandardCharsets.UTF_8));
         return Base64.getEncoder().encodeToString(signature.sign());
     }
