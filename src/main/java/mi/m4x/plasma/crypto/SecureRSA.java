@@ -4,6 +4,10 @@ import javax.crypto.*;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import javax.security.auth.DestroyFailedException;
+import javax.security.auth.Destroyable;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.security.spec.*;
@@ -54,6 +58,15 @@ public final class SecureRSA {
     private static final int GCM_IV_LENGTH = 12; // bytes
     private static final int GCM_TAG_LENGTH = 128; // bits
 
+    // single shared SecureRandom (fallback safe)
+    private static final SecureRandom SECURE_RANDOM;
+    static {
+        SecureRandom tmp;
+        try { tmp = SecureRandom.getInstanceStrong(); }
+        catch (Exception e) { tmp = new SecureRandom(); }
+        SECURE_RANDOM = tmp;
+    }
+
     /**
      * Constructs a SecureRSA instance with the specified RSA key size.
      *
@@ -72,8 +85,7 @@ public final class SecureRSA {
      */
     public void generateKeys() throws NoSuchAlgorithmException {
         KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
-        SecureRandom secureRandom = SecureRandom.getInstanceStrong();
-        keyGen.initialize(rsaKeySize, secureRandom);
+        keyGen.initialize(rsaKeySize, SECURE_RANDOM);
         rsaKeyPair = keyGen.generateKeyPair();
     }
 
@@ -91,11 +103,17 @@ public final class SecureRSA {
      * @note Always verify recipientRsaPub authenticity before encrypting sensitive data.
      */
     public String encrypt(String plainText, PublicKey recipientRsaPub) throws Exception {
-        SecureRandom random = SecureRandom.getInstanceStrong();
+        SecureRandom random = SECURE_RANDOM;
 
+        // generate ephemeral AES key
         byte[] aesBytes = new byte[AES_KEY_SIZE / 8];
         random.nextBytes(aesBytes);
         SecretKey aesKey = new SecretKeySpec(aesBytes, "AES");
+
+        // copy AES bytes into a direct buffer for stronger wipe later
+        ByteBuffer aesDirect = ByteBuffer.allocateDirect(aesBytes.length);
+        aesDirect.put(aesBytes);
+        aesDirect.flip();
 
         byte[] iv = new byte[GCM_IV_LENGTH];
         random.nextBytes(iv);
@@ -108,11 +126,13 @@ public final class SecureRSA {
         rsaCipher.init(Cipher.ENCRYPT_MODE, recipientRsaPub);
         byte[] encryptedAesKey = rsaCipher.doFinal(aesBytes);
 
-        // Zero out AES key material after use
+        // Zero out AES key material after use (heap)
         Arrays.fill(aesBytes, (byte) 0);
-        try {
-            aesKey.destroy();
-        } catch (DestroyFailedException ignored) {}
+        // Zero out direct buffer (off-heap)
+        secureClear(aesDirect);
+
+        // attempt destroy if available
+        try { if (aesKey instanceof Destroyable) ((Destroyable) aesKey).destroy(); } catch (DestroyFailedException ignored) {}
 
         byte[] combined = new byte[encryptedAesKey.length + iv.length + cipherText.length];
         System.arraycopy(encryptedAesKey, 0, combined, 0, encryptedAesKey.length);
@@ -146,10 +166,11 @@ public final class SecureRSA {
         byte[] payload = Base64.getDecoder().decode(base64Payload);
 
         int sigLen = rsaKeySize / 8;
+        if (payload.length < sigLen) throw new SecurityException("Payload too short for signature");
         byte[] signature = Arrays.copyOfRange(payload, 0, sigLen);
         byte[] combined = Arrays.copyOfRange(payload, sigLen, payload.length);
 
-        // Constant-time signature verification
+        // Constant-time signature verification (Signature API used; additional protections below)
         Signature sig = Signature.getInstance("SHA256withRSA");
         sig.initVerify(senderRsaPub);
         sig.update(combined);
@@ -167,19 +188,176 @@ public final class SecureRSA {
         Cipher rsaCipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
         rsaCipher.init(Cipher.DECRYPT_MODE, recipientRsaPriv);
         byte[] aesBytes = rsaCipher.doFinal(encryptedAesKey);
+
+        // copy AES bytes to direct buffer for secure wipe after use
+        ByteBuffer aesDirect = ByteBuffer.allocateDirect(aesBytes.length);
+        aesDirect.put(aesBytes);
+        aesDirect.flip();
+
         SecretKey aesKey = new SecretKeySpec(aesBytes, "AES");
 
+        // zero heap copy
         Arrays.fill(aesBytes, (byte) 0);
 
         Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
         aesCipher.init(Cipher.DECRYPT_MODE, aesKey, new GCMParameterSpec(GCM_TAG_LENGTH, iv));
         byte[] decrypted = aesCipher.doFinal(cipherText);
 
-        try {
-            aesKey.destroy();
-        } catch (DestroyFailedException ignored) {}
+        // Convert to String, then wipe decrypted bytes
+        String result = new String(decrypted, StandardCharsets.UTF_8);
+        Arrays.fill(decrypted, (byte) 0);
 
-        return new String(decrypted, StandardCharsets.UTF_8);
+        // attempt destroy
+        try { if (aesKey instanceof Destroyable) ((Destroyable) aesKey).destroy(); } catch (DestroyFailedException ignored) {}
+
+        // wipe direct buffer
+        secureClear(aesDirect);
+
+        return result;
+    }
+
+    /**
+     * Encrypt with ephemeral ECDH (P-256) key agreement — produces forward secrecy.
+     *
+     * @param plainText plaintext
+     * @param recipientEcPub recipient's EC public key (curve secp256r1)
+     * @param senderRsaPriv sender's RSA private key used to sign the payload
+     * @return Base64 envelope
+     * @throws Exception on failure
+     */
+    public String encryptWithEphemeralECDH(String plainText, PublicKey recipientEcPub, PrivateKey senderRsaPriv) throws Exception {
+        // ephemeral EC keypair
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance("EC");
+        kpg.initialize(new ECGenParameterSpec("secp256r1"), SECURE_RANDOM);
+        KeyPair eph = kpg.generateKeyPair();
+
+        // derive shared secret
+        KeyAgreement ka = KeyAgreement.getInstance("ECDH");
+        ka.init(eph.getPrivate());
+        ka.doPhase(recipientEcPub, true);
+        byte[] shared = ka.generateSecret();
+
+        // derive AES key via SHA-256(shared)
+        MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+        byte[] aesBytes = sha256.digest(shared); // 32 bytes -> AES-256
+
+        // zero shared asap
+        Arrays.fill(shared, (byte) 0);
+
+        SecretKey aesKey = new SecretKeySpec(aesBytes, "AES");
+        // copy aes bytes to direct buffer for wiping
+        ByteBuffer aesDirect = ByteBuffer.allocateDirect(aesBytes.length);
+        aesDirect.put(aesBytes);
+        aesDirect.flip();
+        Arrays.fill(aesBytes, (byte) 0); // wipe heap copy
+
+        byte[] iv = new byte[GCM_IV_LENGTH];
+        SECURE_RANDOM.nextBytes(iv);
+
+        Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
+        aesCipher.init(Cipher.ENCRYPT_MODE, aesKey, new GCMParameterSpec(GCM_TAG_LENGTH, iv));
+        byte[] cipherText = aesCipher.doFinal(plainText.getBytes(StandardCharsets.UTF_8));
+
+        // payload: [ephPubLen:int][ephPub][iv][ciphertext]
+        byte[] ephPubBytes = eph.getPublic().getEncoded();
+        ByteBuffer pb = ByteBuffer.allocate(4 + ephPubBytes.length + iv.length + cipherText.length);
+        pb.putInt(ephPubBytes.length);
+        pb.put(ephPubBytes);
+        pb.put(iv);
+        pb.put(cipherText);
+        byte[] payload = pb.array();
+
+        // sign payload with sender's RSA private key
+        Signature sig = Signature.getInstance("SHA256withRSA");
+        sig.initSign(senderRsaPriv, SECURE_RANDOM);
+        sig.update(payload);
+        byte[] signature = sig.sign();
+
+        // final envelope: [sigLen:int][sig][payload]
+        ByteBuffer out = ByteBuffer.allocate(4 + signature.length + payload.length);
+        out.putInt(signature.length);
+        out.put(signature);
+        out.put(payload);
+
+        // attempt destroy and wipe
+        try { if (aesKey instanceof Destroyable) ((Destroyable) aesKey).destroy(); } catch (DestroyFailedException ignored) {}
+        secureClear(aesDirect);
+
+        return Base64.getEncoder().encodeToString(out.array());
+    }
+
+    /**
+     * Decrypt an envelope produced by {@link #encryptWithEphemeralECDH(String, PublicKey, PrivateKey)}.
+     *
+     * @param base64Envelope base64 string produced by encryptWithEphemeralECDH
+     * @param recipientEcPriv recipient's EC private key (secp256r1)
+     * @param senderRsaPub sender's RSA public key to verify signature
+     * @return plaintext
+     * @throws Exception on failure
+     */
+    public String decryptEphemeralECDH(String base64Envelope, PrivateKey recipientEcPriv, PublicKey senderRsaPub) throws Exception {
+        byte[] raw = Base64.getDecoder().decode(base64Envelope);
+        ByteBuffer buf = ByteBuffer.wrap(raw);
+
+        int sigLen = buf.getInt();
+        if (sigLen <= 0 || sigLen > raw.length - 4) throw new SecurityException("Invalid signature length");
+        byte[] signature = new byte[sigLen];
+        buf.get(signature);
+
+        byte[] payload = new byte[buf.remaining()];
+        buf.get(payload);
+
+        // verify signature
+        Signature sig = Signature.getInstance("SHA256withRSA");
+        sig.initVerify(senderRsaPub);
+        sig.update(payload);
+        if (!sig.verify(signature)) throw new SecurityException("Signature verification failed!");
+
+        ByteBuffer p = ByteBuffer.wrap(payload);
+        int ephLen = p.getInt();
+        if (ephLen <= 0 || ephLen > p.remaining()) throw new SecurityException("Invalid ephemeral public length");
+        byte[] ephPubBytes = new byte[ephLen];
+        p.get(ephPubBytes);
+
+        byte[] iv = new byte[GCM_IV_LENGTH];
+        p.get(iv);
+
+        byte[] cipherText = new byte[p.remaining()];
+        p.get(cipherText);
+
+        KeyFactory kf = KeyFactory.getInstance("EC");
+        PublicKey ephPub = kf.generatePublic(new X509EncodedKeySpec(ephPubBytes));
+
+        // derive shared secret
+        KeyAgreement ka = KeyAgreement.getInstance("ECDH");
+        ka.init(recipientEcPriv);
+        ka.doPhase(ephPub, true);
+        byte[] shared = ka.generateSecret();
+
+        // derive AES key
+        MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+        byte[] aesBytes = sha256.digest(shared);
+        Arrays.fill(shared, (byte) 0);
+
+        // copy to direct buffer for wiping
+        ByteBuffer aesDirect = ByteBuffer.allocateDirect(aesBytes.length);
+        aesDirect.put(aesBytes);
+        aesDirect.flip();
+
+        SecretKey aesKey = new SecretKeySpec(aesBytes, "AES");
+        Arrays.fill(aesBytes, (byte) 0);
+
+        Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
+        aesCipher.init(Cipher.DECRYPT_MODE, aesKey, new GCMParameterSpec(GCM_TAG_LENGTH, iv));
+        byte[] decrypted = aesCipher.doFinal(cipherText);
+
+        String result = new String(decrypted, StandardCharsets.UTF_8);
+        Arrays.fill(decrypted, (byte) 0);
+
+        try { if (aesKey instanceof Destroyable) ((Destroyable) aesKey).destroy(); } catch (DestroyFailedException ignored) {}
+        secureClear(aesDirect);
+
+        return result;
     }
 
     /**
@@ -191,7 +369,7 @@ public final class SecureRSA {
      */
     public String sign(String data) throws Exception {
         Signature signature = Signature.getInstance("SHA256withRSA");
-        signature.initSign(rsaKeyPair.getPrivate(), SecureRandom.getInstanceStrong());
+        signature.initSign(rsaKeyPair.getPrivate(), SECURE_RANDOM);
         signature.update(data.getBytes(StandardCharsets.UTF_8));
         return Base64.getEncoder().encodeToString(signature.sign());
     }
@@ -243,5 +421,65 @@ public final class SecureRSA {
         PublicKey publicKey = kf.generatePublic(new X509EncodedKeySpec(Base64.getDecoder().decode(pub)));
         PrivateKey privateKey = kf.generatePrivate(new PKCS8EncodedKeySpec(Base64.getDecoder().decode(priv)));
         rsaKeyPair = new KeyPair(publicKey, privateKey);
+    }
+
+    /**
+     * Store a private key into a JKS keystore file (or other keystore type if configured).
+     * Note: In production you should use platform-specific keystores (PKCS11, Windows-MY, Apple Keychain).
+     *
+     * @param keystorePath file path to write keystore
+     * @param password     keystore password
+     * @param alias        alias to store key at
+     * @param key          private key to store
+     * @throws Exception on IO or keystore errors
+     */
+    public static void storeKeyInKeyStore(String keystorePath, char[] password, String alias, Key key) throws Exception {
+        KeyStore ks = KeyStore.getInstance(KeyStore.getDefaultType());
+        ks.load(null, password);
+        if (key instanceof PrivateKey) {
+            // store private key as a key entry (no cert chain supplied)
+            ks.setKeyEntry(alias, key, password, null);
+        } else {
+            // for public keys, store as a trusted cert entry isn't done here; callers may store differently
+            throw new IllegalArgumentException("Only private keys can be stored with this helper. Use certificate-based storage for public keys.");
+        }
+        try (FileOutputStream fos = new FileOutputStream(keystorePath)) {
+            ks.store(fos, password);
+        }
+    }
+
+    /**
+     * Load a private key from a keystore file.
+     *
+     * @param keystorePath keystore path
+     * @param password     password
+     * @param alias        alias of key
+     * @return Key (PrivateKey)
+     * @throws Exception on error
+     */
+    public static Key loadKeyFromKeyStore(String keystorePath, char[] password, String alias) throws Exception {
+        KeyStore ks = KeyStore.getInstance(KeyStore.getDefaultType());
+        try (FileInputStream fis = new FileInputStream(keystorePath)) {
+            ks.load(fis, password);
+        }
+        Key key = ks.getKey(alias, password);
+        if (key == null) throw new IllegalArgumentException("No key found for alias: " + alias);
+        return key;
+    }
+
+    /**
+     * Securely clears a direct ByteBuffer (off-heap) by overwriting with zeros.
+     *
+     * @param buffer direct ByteBuffer to clear
+     */
+    private static void secureClear(ByteBuffer buffer) {
+        if (buffer == null) return;
+        // ensure direct buffer
+        try {
+            buffer.clear();
+            while (buffer.hasRemaining()) buffer.put((byte) 0);
+            buffer.clear();
+        } catch (Exception ignored) {
+        }
     }
 }
